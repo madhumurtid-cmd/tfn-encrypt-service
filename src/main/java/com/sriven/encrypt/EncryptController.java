@@ -1,83 +1,128 @@
 package com.sriven.encrypt;
 
 import org.springframework.web.bind.annotation.*;
+import org.springframework.web.client.RestTemplate;
+
 import java.util.*;
+import java.security.MessageDigest;
+import java.nio.charset.StandardCharsets;
 
 import org.bouncycastle.crypto.fpe.FPEFF1Engine;
 import org.bouncycastle.crypto.params.FPEParameters;
 import org.bouncycastle.crypto.params.KeyParameter;
 
-import java.nio.charset.StandardCharsets;
-
 @RestController
+@RequestMapping("/crypto")
 public class EncryptController {
 
+    private final RestTemplate restTemplate = new RestTemplate();
+    private final String KMS_URL = "http://localhost:8081";
+
     // =========================
-    // 🔐 ENCRYPT ENDPOINT
+    // ENCRYPT
     // =========================
     @PostMapping("/encrypt")
     public Map<String, Object> encrypt(@RequestBody Map<String, Object> input) {
 
-        String key = getKey();
+        validateNotAlreadyEncrypted(input);
 
-        Map<String, Object> output = new HashMap<>();
+        String keyId = (String) input.get("keyId");
+        String key = fetchKeyFromKMS(keyId);
 
-        output.put("TFN", processTFN((String) input.get("TFN"), key, true));
-        output.put("TFN_SECONDARY", processTFN((String) input.get("TFN_SECONDARY"), key, true));
-        output.put("TFN_TERTIARY", processTFN((String) input.get("TFN_TERTIARY"), key, true));
-
-        output.put("ENCRYPTED_FLAG", "Y");
-
-        return output;
+        return processAll(input, key, true);
     }
 
     // =========================
-    // 🔓 DECRYPT ENDPOINT
+    // DECRYPT
     // =========================
     @PostMapping("/decrypt")
     public Map<String, Object> decrypt(@RequestBody Map<String, Object> input) {
 
-        String key = getKey();
+        validateIsEncrypted(input);
+
+        String keyId = (String) input.get("keyId");
+        String key = fetchKeyFromKMS(keyId);
+
+        return processAll(input, key, false);
+    }
+
+    // =========================
+    // VALIDATIONS (NEW)
+    // =========================
+    private void validateNotAlreadyEncrypted(Map<String, Object> input) {
+
+        Object flag = input.get("ENCRYPTED_FLAG");
+
+        if ("Y".equalsIgnoreCase(String.valueOf(flag))) {
+            throw new IllegalStateException(
+                "Payload is already encrypted. Double encryption is not allowed."
+            );
+        }
+    }
+
+    private void validateIsEncrypted(Map<String, Object> input) {
+
+        Object flag = input.get("ENCRYPTED_FLAG");
+
+        if (!"Y".equalsIgnoreCase(String.valueOf(flag))) {
+            throw new IllegalStateException(
+                "Payload is not encrypted. Cannot decrypt."
+            );
+        }
+    }
+
+    // =========================
+    // SHARED LOGIC
+    // =========================
+    private Map<String, Object> processAll(Map<String, Object> input, String key, boolean encryptMode) {
 
         Map<String, Object> output = new HashMap<>();
 
-        output.put("TFN", processTFN((String) input.get("TFN"), key, false));
-        output.put("TFN_SECONDARY", processTFN((String) input.get("TFN_SECONDARY"), key, false));
-        output.put("TFN_TERTIARY", processTFN((String) input.get("TFN_TERTIARY"), key, false));
+        output.put("TFN", processTFN((String) input.get("TFN"), key, encryptMode));
+        output.put("TFN_SECONDARY", processTFN((String) input.get("TFN_SECONDARY"), key, encryptMode));
+        output.put("TFN_TERTIARY", processTFN((String) input.get("TFN_TERTIARY"), key, encryptMode));
 
-        output.put("DECRYPTED_FLAG", "Y");
+        output.put("ENCRYPTED_FLAG", encryptMode ? "Y" : "N");
 
         return output;
     }
 
     // =========================
-    // 🔁 CORE FF1 LOGIC
+    // KMS CALL
+    // =========================
+    private String fetchKeyFromKMS(String keyId) {
+
+        if (keyId == null || keyId.isBlank()) {
+            throw new IllegalArgumentException("keyId is required");
+        }
+
+        return restTemplate.getForObject(
+                KMS_URL + "/key/decrypt?keyId=" + keyId,
+                String.class
+        );
+    }
+
+    // =========================
+    // FF1 PROCESSING
     // =========================
     private String processTFN(String tfn, String keyStr, boolean encryptMode) {
 
-        if (tfn == null || tfn.trim().isEmpty()) {
-            return null;
-        }
+        if (tfn == null || tfn.trim().isEmpty()) return null;
 
         try {
-            // Remove dashes
             String digits = tfn.replace("-", "");
 
-            // Validate numeric
-            if (!digits.matches("\\d+")) {
-                throw new RuntimeException("Invalid TFN: " + tfn);
+            if (!digits.matches("\\d{10}")) {
+                throw new IllegalArgumentException("Invalid TFN format");
             }
 
-            // Convert digits → byte[]
             byte[] input = new byte[digits.length()];
             for (int i = 0; i < digits.length(); i++) {
                 input[i] = (byte) (digits.charAt(i) - '0');
             }
 
-            // Key (16 bytes)
-            byte[] key = Arrays.copyOf(keyStr.getBytes(StandardCharsets.UTF_8), 16);
+            byte[] key = deriveKey(keyStr);
 
-            // 🔥 FIXED: use EMPTY tweak (NOT null)
             FPEParameters params = new FPEParameters(
                     new KeyParameter(key),
                     10,
@@ -88,42 +133,34 @@ public class EncryptController {
             engine.init(encryptMode, params);
 
             byte[] output = new byte[input.length];
-
             engine.processBlock(input, 0, input.length, output, 0);
 
-            // Convert back safely
             StringBuilder result = new StringBuilder();
             for (byte b : output) {
-                int digit = b & 0xFF;   // 🔥 ensure positive
-                digit = digit % 10;     // 🔥 ensure 0–9
-                result.append(digit);
+                result.append((int) b);
             }
 
             String formatted = result.toString();
 
-            if (formatted.length() != 10) {
-                throw new RuntimeException("Invalid output length: " + formatted);
-            }
-
-            // Format back to TFN
             return formatted.substring(0, 4) + "-" +
                    formatted.substring(4, 8) + "-" +
                    formatted.substring(8, 10);
 
         } catch (Exception e) {
-            e.printStackTrace();
-            throw new RuntimeException("TFN processing failed: " + tfn, e);
+            throw new RuntimeException("TFN processing failed", e);
         }
     }
 
     // =========================
-    // 🔑 ENV KEY
+    // KEY DERIVATION
     // =========================
-    private String getKey() {
-        String key = System.getenv("TFN_KEY");
-        if (key == null || key.isEmpty()) {
-            throw new RuntimeException("TFN_KEY not set in environment");
-        }
-        return key;
+    private byte[] deriveKey(String keyStr) throws Exception {
+
+        MessageDigest digest = MessageDigest.getInstance("SHA-256");
+
+        return Arrays.copyOf(
+                digest.digest(keyStr.getBytes(StandardCharsets.UTF_8)),
+                16
+        );
     }
 }
