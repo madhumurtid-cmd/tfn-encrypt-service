@@ -1,2 +1,7 @@
 com\sriven\encrypt\EncryptController.class
+com\sriven\security\SecurityConfig.class
+com\sriven\kms\KmsStubController.class
+com\sriven\security\JwtUtil.class
+com\sriven\security\JwtFilter.class
 com\sriven\encrypt\EncryptApplication.class
+com\sriven\security\AuthController.class
