@@ -4,6 +4,7 @@ import org.springframework.web.bind.annotation.*;
 import org.springframework.web.client.RestTemplate;
 import org.springframework.web.server.ResponseStatusException;
 import org.springframework.http.HttpStatus;
+import org.springframework.boot.web.client.RestTemplateBuilder;
 
 import org.springframework.security.core.context.SecurityContextHolder;
 import org.springframework.security.core.Authentication;
@@ -11,6 +12,7 @@ import org.springframework.security.core.Authentication;
 import java.util.*;
 import java.security.MessageDigest;
 import java.nio.charset.StandardCharsets;
+import java.time.Duration;
 
 import org.bouncycastle.crypto.fpe.FPEFF1Engine;
 import org.bouncycastle.crypto.params.FPEParameters;
@@ -20,16 +22,14 @@ import org.bouncycastle.crypto.params.KeyParameter;
 @RequestMapping("/crypto")
 public class EncryptController {
 
-    private final RestTemplate restTemplate = new RestTemplate();
+    private final RestTemplate restTemplate;
     private final String KMS_URL = "http://localhost:8081";
 
-    // =========================
-    // DEBUG (optional)
-    // =========================
-    @GetMapping("/debug/auth")
-    public String debugAuth() {
-        Authentication auth = SecurityContextHolder.getContext().getAuthentication();
-        return "AUTH=" + auth.getAuthorities();
+    public EncryptController(RestTemplateBuilder builder) {
+        this.restTemplate = builder
+                .setConnectTimeout(Duration.ofSeconds(3))
+                .setReadTimeout(Duration.ofSeconds(3))
+                .build();
     }
 
     // =========================
@@ -38,10 +38,10 @@ public class EncryptController {
     @PostMapping("/encrypt")
     public Map<String, Object> encrypt(@RequestBody Map<String, Object> input) {
 
-        String keyId = (String) input.get("keyId");
-        String key = fetchKeyFromKMS(keyId);
-        System.out.println("🔥 HIT ENCRYPT ENDPOINT");
+        String keyId = extractString(input.get("keyId"), "keyId");
         validateForEncryption(input);
+
+        String key = fetchKeyFromKMS(keyId);
 
         return processAll(input, key, true);
     }
@@ -52,81 +52,18 @@ public class EncryptController {
     @PostMapping("/decrypt")
     public Map<String, Object> decrypt(@RequestBody Map<String, Object> input) {
 
-        String keyId = (String) input.get("keyId");
+        String keyId = extractString(input.get("keyId"), "keyId");
         String key = fetchKeyFromKMS(keyId);
 
         boolean recovery = Boolean.TRUE.equals(input.get("recovery"));
 
         if (recovery) {
-            validateRecoveryAccess(); // 🔐 only here we enforce role
+            validateRecoveryAccess();
         } else {
-            validateEncryptedInputs(input, key); // fail-fast
+            validateEncryptedInputs(input, key);
         }
 
         return processAll(input, key, false);
-    }
-
-    // =========================
-    // DRY RUN
-    // =========================
-    @PostMapping("/decrypt/dry-run")
-    public Map<String, Object> dryRun(@RequestBody Map<String, Object> input) {
-
-        String keyId = (String) input.get("keyId");
-        String key = fetchKeyFromKMS(keyId);
-
-        List<Map<String, Object>> results = new ArrayList<>();
-
-        processDryRunField(results, "TFN", (String) input.get("TFN"), key);
-        processDryRunField(results, "TFN_SECONDARY", (String) input.get("TFN_SECONDARY"), key);
-        processDryRunField(results, "TFN_TERTIARY", (String) input.get("TFN_TERTIARY"), key);
-
-        return Map.of(
-                "results", results,
-                "summary", generateSummary(results)
-        );
-    }
-
-    // =========================
-    // DRY RUN HELPERS
-    // =========================
-    private void processDryRunField(List<Map<String, Object>> results,
-                                   String field,
-                                   String value,
-                                   String key) {
-
-        if (value == null) return;
-
-        boolean encrypted = isAlreadyEncrypted(value, key);
-
-        String proposed = processTFN(value, key, false);
-
-        String action = encrypted ? "DECRYPT" : "SKIP";
-
-        results.add(Map.of(
-                "field", field,
-                "input", value,
-                "looksEncrypted", encrypted,
-                "proposedOutput", proposed,
-                "action", action
-        ));
-    }
-
-    private Map<String, Object> generateSummary(List<Map<String, Object>> results) {
-
-        long decrypt = results.stream()
-                .filter(r -> r.get("action").equals("DECRYPT"))
-                .count();
-
-        long skip = results.stream()
-                .filter(r -> r.get("action").equals("SKIP"))
-                .count();
-
-        return Map.of(
-                "total", results.size(),
-                "decryptCount", decrypt,
-                "skipCount", skip
-        );
     }
 
     // =========================
@@ -134,33 +71,27 @@ public class EncryptController {
     // =========================
     private void validateForEncryption(Map<String, Object> input) {
 
-    Object flag = input.get("shouldEncrypt");  // ✅ define it
+        Object flag = input.get("shouldEncrypt");
 
-    Boolean shouldEncrypt = false;
+        boolean shouldEncrypt =
+                (flag instanceof Boolean && (Boolean) flag) ||
+                (flag instanceof String && Boolean.parseBoolean((String) flag));
 
-    if (flag instanceof Boolean) {
-        shouldEncrypt = (Boolean) flag;
-    } else if (flag instanceof String) {
-        shouldEncrypt = Boolean.parseBoolean((String) flag);
+        if (!shouldEncrypt) {
+            throw new ResponseStatusException(
+                    HttpStatus.BAD_REQUEST,
+                    "Encryption not allowed"
+            );
+        }
     }
-
-    if (!Boolean.TRUE.equals(shouldEncrypt)) {
-        throw new ResponseStatusException(
-                HttpStatus.BAD_REQUEST,
-                "Encryption not allowed (false positive prevention)"
-        );
-    }
-}
 
     private void validateEncryptedInputs(Map<String, Object> input, String key) {
-
         checkField(input.get("TFN"), key, "TFN");
         checkField(input.get("TFN_SECONDARY"), key, "TFN_SECONDARY");
         checkField(input.get("TFN_TERTIARY"), key, "TFN_TERTIARY");
     }
 
     private void checkField(Object valueObj, String key, String fieldName) {
-
         if (valueObj == null) return;
 
         String value = valueObj.toString();
@@ -168,41 +99,30 @@ public class EncryptController {
         if (!isAlreadyEncrypted(value, key)) {
             throw new ResponseStatusException(
                     HttpStatus.BAD_REQUEST,
-                    fieldName + " is not encrypted. Aborting decrypt."
+                    fieldName + " is not encrypted"
             );
         }
     }
 
     // =========================
-    // RECOVERY SECURITY
+    // KMS CALL (with timeout safety)
     // =========================
-    private void validateRecoveryAccess() {
+    private String fetchKeyFromKMS(String keyId) {
 
-        Authentication auth = SecurityContextHolder.getContext().getAuthentication();
-
-        if (auth == null || auth.getAuthorities().stream()
-                .noneMatch(a -> a.getAuthority().equals("ROLE_RECOVERY"))) {
-
-            throw new ResponseStatusException(
-                    HttpStatus.FORBIDDEN,
-                    "Recovery mode requires RECOVERY role"
-            );
+        if (keyId == null || keyId.isBlank()) {
+            throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "Missing keyId");
         }
-    }
-
-    // =========================
-    // DETECTION
-    // =========================
-    private boolean isAlreadyEncrypted(String value, String key) {
 
         try {
-            String decrypted = processTFN(value, key, false);
-            String reEncrypted = processTFN(decrypted, key, true);
-
-            return value.equals(reEncrypted);
-
+            return restTemplate.getForObject(
+                    KMS_URL + "/key/decrypt?keyId=" + keyId,
+                    String.class
+            );
         } catch (Exception e) {
-            return false;
+            throw new ResponseStatusException(
+                    HttpStatus.BAD_GATEWAY,
+                    "KMS unavailable"
+            );
         }
     }
 
@@ -215,9 +135,9 @@ public class EncryptController {
 
         Map<String, Object> output = new HashMap<>();
 
-        output.put("TFN", processTFN((String) input.get("TFN"), key, encryptMode));
-        output.put("TFN_SECONDARY", processTFN((String) input.get("TFN_SECONDARY"), key, encryptMode));
-        output.put("TFN_TERTIARY", processTFN((String) input.get("TFN_TERTIARY"), key, encryptMode));
+        output.put("TFN", processTFN(extractString(input.get("TFN"), "TFN"), key, encryptMode));
+        output.put("TFN_SECONDARY", processTFN(extractString(input.get("TFN_SECONDARY"), "TFN_SECONDARY"), key, encryptMode));
+        output.put("TFN_TERTIARY", processTFN(extractString(input.get("TFN_TERTIARY"), "TFN_TERTIARY"), key, encryptMode));
 
         output.put("ENCRYPTED_FLAG", encryptMode ? "Y" : "N");
 
@@ -225,29 +145,31 @@ public class EncryptController {
     }
 
     // =========================
-    // KMS CALL
+    // SAFE STRING EXTRACTION
     // =========================
-    private String fetchKeyFromKMS(String keyId) {
+    private String extractString(Object obj, String fieldName) {
 
-    try {
-        return restTemplate.getForObject(
-            KMS_URL + "/key/decrypt?keyId=" + keyId,
-            String.class
-        );
-    } catch (Exception e) {
+        if (obj == null) return null;
+
+        if (obj instanceof String) return (String) obj;
+
+        if (obj instanceof Map) {
+            Object val = ((Map<?, ?>) obj).get("value");
+            if (val != null) return val.toString();
+        }
+
         throw new ResponseStatusException(
-            HttpStatus.BAD_GATEWAY,
-            "KMS service unavailable"
+                HttpStatus.BAD_REQUEST,
+                "Invalid format for " + fieldName
         );
     }
-}
 
     // =========================
-    // FPE
+    // THREAD-SAFE FPE (CRITICAL FIX)
     // =========================
     private String processTFN(String tfn, String keyStr, boolean encryptMode) {
 
-        if (tfn == null || tfn.trim().isEmpty()) return null;
+        if (tfn == null || tfn.isBlank()) return null;
 
         try {
             String digits = tfn.replace("-", "");
@@ -255,7 +177,7 @@ public class EncryptController {
             if (!digits.matches("\\d{10}")) {
                 throw new ResponseStatusException(
                         HttpStatus.BAD_REQUEST,
-                        "Invalid TFN format: " + tfn
+                        "Invalid TFN format"
                 );
             }
 
@@ -272,6 +194,7 @@ public class EncryptController {
                     new byte[0]
             );
 
+            // 🔥 CRITICAL: new engine per call (thread-safe)
             FPEFF1Engine engine = new FPEFF1Engine();
             engine.init(encryptMode, params);
 
@@ -289,8 +212,6 @@ public class EncryptController {
                    formatted.substring(4, 8) + "-" +
                    formatted.substring(8, 10);
 
-        } catch (ResponseStatusException e) {
-            throw e;
         } catch (Exception e) {
             throw new ResponseStatusException(
                     HttpStatus.INTERNAL_SERVER_ERROR,
@@ -300,12 +221,37 @@ public class EncryptController {
     }
 
     private byte[] deriveKey(String keyStr) throws Exception {
-
         MessageDigest digest = MessageDigest.getInstance("SHA-256");
-
         return Arrays.copyOf(
                 digest.digest(keyStr.getBytes(StandardCharsets.UTF_8)),
                 16
         );
+    }
+
+    // =========================
+    // SECURITY
+    // =========================
+    private void validateRecoveryAccess() {
+
+        Authentication auth = SecurityContextHolder.getContext().getAuthentication();
+
+        if (auth == null || auth.getAuthorities().stream()
+                .noneMatch(a -> a.getAuthority().equals("ROLE_RECOVERY"))) {
+
+            throw new ResponseStatusException(
+                    HttpStatus.FORBIDDEN,
+                    "Recovery requires ROLE_RECOVERY"
+            );
+        }
+    }
+
+    private boolean isAlreadyEncrypted(String value, String key) {
+        try {
+            String decrypted = processTFN(value, key, false);
+            String reEncrypted = processTFN(decrypted, key, true);
+            return value.equals(reEncrypted);
+        } catch (Exception e) {
+            return false;
+        }
     }
 }
